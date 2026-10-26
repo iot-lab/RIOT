@@ -23,6 +23,8 @@
 
 /** GPIO Pin ID for the onboard LED */
 #define LED0_PIN_ID 25u
+/** GPIO pin of the onboard LED */
+#define LED0_PIN        GPIO_PIN(0, LED0_PIN_ID)
 #define LED0_ON         gpio_set(LED0_PIN_ID)
 #define LED0_OFF        gpio_clear(LED0_PIN_ID)
 #define LED0_TOGGLE     gpio_toggle(LED0_PIN_ID)
