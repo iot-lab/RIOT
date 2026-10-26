@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: 2026 Inria
+# SPDX-License-Identifier: LGPL-2.1-only
+
+config CPU_FAM_MAX78000
+    bool
+
+## CPU Models
+config CPU_MODEL_MAX78000
+    bool
+    select CPU_CORE_CORTEX_M4F
+    select CPU_FAM_MAX78000
+
+## CPU common symbols
+config CPU_FAM
+    default "max78000" if CPU_FAM_MAX78000
+
+config CPU_MODEL
+    default "max78000" if CPU_MODEL_MAX78000
+
+config CPU
+    default "max78000" if CPU_FAM_MAX78000
+
+source "$(RIOTCPU)/cortexm_common/Kconfig"

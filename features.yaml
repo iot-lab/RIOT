@@ -238,6 +238,11 @@ groups:
         help: The MCU has an STM32 MCU
 
       groups:
+      - title: Analog Devices Grouping
+        features:
+        - name: cpu_max78000
+          help: The MCU is an Analog Devices (formerly Maxim Integrated) MAX78000
+
       - title: Atmel / Microchip SAM Grouping
         groups:
         - title: SAM0 Grouping

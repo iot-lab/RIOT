@@ -76,6 +76,7 @@ FEATURES_EXISTING := \
     cpu_lm4f120 \
     cpu_lpc1768 \
     cpu_lpc23xx \
+    cpu_max78000 \
     cpu_msp430 \
     cpu_msp430_f2xx_g2xx \
     cpu_msp430_x1xx \
