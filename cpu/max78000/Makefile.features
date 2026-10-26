@@ -1,0 +1,10 @@
+CPU_CORE = cortex-m4f
+CPU_FAM  = max78000
+
+# Put defined MCU peripherals here (in alphabetical order)
+FEATURES_PROVIDED += periph_cpuid
+FEATURES_PROVIDED += periph_gpio periph_gpio_irq
+FEATURES_PROVIDED += periph_timer_query_freqs
+FEATURES_PROVIDED += periph_uart_modecfg
+
+include $(RIOTCPU)/cortexm_common/Makefile.features
