@@ -1,14 +1,25 @@
 USEMODULE += event
-USEMODULE += l2util
-USEMODULE += netdev
+USEMODULE += luid
 USEMODULE += openthread_contrib
-USEMODULE += openthread_contrib_netdev
+USEMODULE += random
+USEMODULE += ztimer
+USEMODULE += ztimer_msec
+
+# the radio is driven through the IEEE 802.15.4 Radio HAL, not netdev
+DISABLE_MODULE += auto_init_at86rf2xx
+
+# radios that don't send the ACKs of the received frames themselves (the
+# radios for which the SubMac of RIOT uses ieee802154_submac_soft_ack)
+ifneq (,$(filter nrf802154 socket_zep,$(USEMODULE)))
+  USEMODULE += openthread_soft_ack
+endif
+
+ifneq (,$(filter kw2xrf mrf24j40,$(USEMODULE)))
+  USEMODULE += bhp_event
+endif
 
 ifneq (,$(filter openthread-cli-%,$(USEMODULE)))
   USEMODULE += shell_cmds_default
 endif
-
-USEMODULE += ztimer
-USEMODULE += ztimer_msec
 
 FEATURES_REQUIRED += cpp

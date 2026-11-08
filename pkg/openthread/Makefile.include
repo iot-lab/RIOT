@@ -1,11 +1,13 @@
 OPENTHREAD_DIR = $(RIOTBASE)/pkg/openthread
 
+# the OpenThread radio layer sends the ACKs of the received frames
+PSEUDOMODULES += openthread_soft_ack
+
 INCLUDES += -I$(PKGDIRBASE)/openthread/include
 INCLUDES += -I$(OPENTHREAD_DIR)/include
 
 ifneq (,$(filter openthread_contrib,$(USEMODULE)))
   DIRS += $(OPENTHREAD_DIR)/contrib
-  DIRS += $(OPENTHREAD_DIR)/contrib/netdev
 endif
 
 ifneq (,$(filter cortex-m0% cortex-m3%,$(CPU_CORE)))
@@ -15,5 +17,7 @@ ifneq (,$(filter cortex-m0% cortex-m3%,$(CPU_CORE)))
 endif
 
 ARCHIVES += $(addprefix $(BINDIR)/,$(addsuffix .a,$(filter openthread-%,$(USEMODULE))))
+# settings in RAM (examples/platforms/utils of OpenThread)
+ARCHIVES += $(BINDIR)/openthread-platform-utils-static.a
 ARCHIVES += $(BINDIR)/mbedcrypto.a
 ARCHIVES += $(BINDIR)/mbedtls.a

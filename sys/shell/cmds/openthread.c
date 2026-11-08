@@ -10,24 +10,40 @@
  * @file
  * @brief       Shell command implementation for OpenThread
  *
+ * The command line is run by the OpenThread CLI in the OpenThread thread:
+ * the shell waits until it's done.
+ *
  * @author      Moritz Voigt <moritz.voigt@mailbox.tu-dresden.de>
  *
  * @}
  */
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
+#include "event.h"
+#include "mutex.h"
 #include "shell.h"
 #include "openthread/cli.h"
+#include "ot.h"
 
-static int ot_console_cb(const char *abuf, uint16_t bufsize, void *context)
+static char *_line;
+static mutex_t _done = MUTEX_INIT_LOCKED;
+
+static int ot_console_cb(void *context, const char *format, va_list args)
 {
-    (void) context;
-    if (bufsize > 0) {
-        printf("%.*s", bufsize, abuf);
-    }
-    return 0;
+    (void)context;
+    return vprintf(format, args);
 }
+
+static void _input_handler(event_t *event)
+{
+    (void)event;
+    otCliInputLine(_line);
+    mutex_unlock(&_done);
+}
+
+static event_t _ev_input = { .handler = _input_handler };
 
 static int ot_cmd(int argc, char **argv)
 {
@@ -38,12 +54,10 @@ static int ot_cmd(int argc, char **argv)
         *arg = ' ';
     }
 
-    if (strlen(argv[1]) != 0) {
-        otCliConsoleInputLine(argv[1], strlen(argv[1]));
-    }
-    else {
-        otCliConsoleInputLine("help", strlen("help"));
-    }
+    static char help[] = "help";
+    _line = (argc > 1) && (strlen(argv[1]) != 0) ? argv[1] : help;
+    event_post(openthread_get_evq(), &_ev_input);
+    mutex_lock(&_done);
     return 0;
 }
 
@@ -51,5 +65,5 @@ SHELL_COMMAND(ot, "Use commands from OpenThread CLI", ot_cmd);
 
 void ot_shell_init(otInstance *aInstance)
 {
-    otCliConsoleInit(aInstance, ot_console_cb, NULL);
+    otCliInit(aInstance, ot_console_cb, NULL);
 }

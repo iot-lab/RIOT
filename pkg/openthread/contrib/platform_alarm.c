@@ -13,12 +13,12 @@
  * @}
  */
 
+#include <inttypes.h>
 #include <stdint.h>
 
-#include "msg.h"
+#include "event.h"
 #include "openthread/platform/alarm-milli.h"
 #include "ot.h"
-#include "thread.h"
 #include "ztimer.h"
 
 #define ENABLE_DEBUG 0
@@ -26,7 +26,7 @@
 
 static void _ev_timer_handler(event_t *event)
 {
-    (void) event;
+    (void)event;
     otPlatAlarmMilliFired(openthread_get_instance());
 }
 
@@ -34,9 +34,9 @@ static event_t ev_timer = {
     .handler = _ev_timer_handler
 };
 
-void _timeout_cb(void *arg)
+static void _timeout_cb(void *arg)
 {
-    (void) arg;
+    (void)arg;
     event_post(openthread_get_evq(), &ev_timer);
 }
 
@@ -54,15 +54,17 @@ static ztimer_t ot_timer = {
 void otPlatAlarmMilliStartAt(otInstance *aInstance, uint32_t aT0, uint32_t aDt)
 {
     (void)aInstance;
-    (void)aT0;
 
     DEBUG("openthread: otPlatAlarmStartAt: aT0: %" PRIu32 ", aDT: %" PRIu32 "\n", aT0, aDt);
 
-    if (aDt == 0) {
+    /* time already elapsed since aT0, modulo 2^32 */
+    uint32_t elapsed = ztimer_now(ZTIMER_MSEC) - aT0;
+
+    if (elapsed >= aDt) {
         event_post(openthread_get_evq(), &ev_timer);
     }
     else {
-        ztimer_set(ZTIMER_MSEC, &ot_timer, aDt);
+        ztimer_set(ZTIMER_MSEC, &ot_timer, aDt - elapsed);
     }
 }
 
@@ -78,6 +80,7 @@ void otPlatAlarmMilliStop(otInstance *aInstance)
 uint32_t otPlatAlarmMilliGetNow(void)
 {
     uint32_t now = ztimer_now(ZTIMER_MSEC);
+
     DEBUG("openthread: otPlatAlarmGetNow: %" PRIu32 "\n", now);
     return now;
 }

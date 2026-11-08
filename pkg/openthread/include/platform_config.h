@@ -39,6 +39,22 @@ extern "C" {
  */
 #define OPENTHREAD_CONFIG_LOG_LEVEL OT_LOG_LEVEL_NONE
 
+/**
+ * @def OPENTHREAD_CONFIG_PLATFORM_ASSERT_MANAGEMENT
+ *
+ * The assertions of OpenThread call otPlatAssertFail(), implemented with the
+ * assert() of RIOT
+ */
+#define OPENTHREAD_CONFIG_PLATFORM_ASSERT_MANAGEMENT 1
+
+/**
+ * @def OPENTHREAD_CONFIG_CLI_LOG_INPUT_OUTPUT_ENABLE
+ *
+ * The CLI prints on the RIOT shell: don't copy its input and output to the
+ * logs (enabled by default on the native boards)
+ */
+#define OPENTHREAD_CONFIG_CLI_LOG_INPUT_OUTPUT_ENABLE 0
+
 #ifdef __cplusplus
 }
 #endif

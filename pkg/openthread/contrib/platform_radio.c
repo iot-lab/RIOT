@@ -7,421 +7,615 @@
  * @{
  * @ingroup     net
  * @file
- * @brief       Implementation of OpenThread radio platform abstraction
+ * @brief       Implementation of OpenThread radio platform abstraction on the
+ *              IEEE 802.15.4 Radio HAL
+ *
+ * The capabilities of the radio are given to OpenThread: what the radio
+ * doesn't do (CSMA-CA, retransmissions, ACK timeout) is done by the SubMac of
+ * OpenThread. The ACKs of the received frames are sent by the radio (as the
+ * SubMac of RIOT assumes without the `ieee802154_submac_soft_ack` module).
+ *
+ * The Radio HAL callback can run in interrupt context: it only posts events
+ * to the OpenThread event queue, every radio access is done in the
+ * OpenThread thread.
  *
  * @author      Jose Ignacio Alamos <jialamos@uc.cl>
  * @}
  */
 
-#include <stdio.h>
+#include <errno.h>
 #include <string.h>
 
 #include "byteorder.h"
-#include "errno.h"
-#include "net/ethernet/hdr.h"
-#include "net/ethertype.h"
+#include "event.h"
+#include "iolist.h"
+#include "kernel_defines.h"
+#include "luid.h"
+#include "net/eui64.h"
 #include "net/ieee802154.h"
-#include "net/l2util.h"
-#include "net/netdev/ieee802154.h"
-#include "openthread/platform/diag.h"
+#include "net/ieee802154/radio.h"
+#include "time_units.h"
+
 #include "openthread/platform/radio.h"
 #include "ot.h"
 
 #define ENABLE_DEBUG 0
 #include "debug.h"
 
-#define RADIO_IEEE802154_FCS_LEN    (2U)
+/* PSDU of an ACK frame: frame control, sequence number, FCS */
+#define ACK_PSDU_LEN            (IEEE802154_ACK_FRAME_LEN)
+#define DEFAULT_CHANNEL         (CONFIG_IEEE802154_DEFAULT_CHANNEL)
+#define DEFAULT_TX_POWER        (0)
 
-static otRadioFrame sTransmitFrame;
-static otRadioFrame sReceiveFrame;
-static int8_t Rssi;
+static ieee802154_dev_t *_dev;
+static otRadioState _state = OT_RADIO_STATE_DISABLED;
+static uint8_t _channel = DEFAULT_CHANNEL;
+static int8_t _tx_power = DEFAULT_TX_POWER;
+static int8_t _cca_threshold = -75;
+static bool _promiscuous;
+/* waiting for the ACK of the last frame, in software */
+static bool _wait_ack;
+/* error of a transmission that didn't start, reported by _ev_tx_failed */
+static otError _tx_error;
 
-static netdev_t *_dev;
+static otRadioFrame _tx_frame;
+static uint8_t _tx_psdu[OT_RADIO_FRAME_MAX_SIZE];
+static otRadioFrame _rx_frame;
+static uint8_t _rx_psdu[OT_RADIO_FRAME_MAX_SIZE];
+static otRadioFrame _ack_frame;
+static uint8_t _ack_psdu[ACK_PSDU_LEN];
 
-/* set 15.4 channel */
-static int _set_channel(uint16_t channel)
+static void _rx_done_handler(event_t *event);
+static void _crc_error_handler(event_t *event);
+static void _tx_start_handler(event_t *event);
+static void _tx_done_handler(event_t *event);
+static void _tx_failed_handler(event_t *event);
+
+static event_t _ev_rx_done = { .handler = _rx_done_handler };
+static event_t _ev_crc_error = { .handler = _crc_error_handler };
+static event_t _ev_tx_start = { .handler = _tx_start_handler };
+static event_t _ev_tx_done = { .handler = _tx_done_handler };
+static event_t _ev_tx_failed = { .handler = _tx_failed_handler };
+
+static bool _has_cap(uint32_t cap)
 {
-    return _dev->driver->set(_dev, NETOPT_CHANNEL, &channel, sizeof(uint16_t));
+    return ieee802154_radio_has_capability(_dev, cap);
 }
 
-/* set transmission power */
-static int _set_power(int16_t power)
+/* the radio waits for the ACK (and retransmits) */
+static bool _radio_handles_ack(void)
 {
-    return _dev->driver->set(_dev, NETOPT_TX_POWER, &power, sizeof(int16_t));
+    return _has_cap(IEEE802154_CAP_FRAME_RETRANS) || _has_cap(IEEE802154_CAP_IRQ_ACK_TIMEOUT);
 }
 
-static int _get_power(void)
+static void _hal_cb(ieee802154_dev_t *dev, ieee802154_trx_ev_t status)
 {
-    int16_t power;
-    _dev->driver->get(_dev, NETOPT_TX_POWER, &power, sizeof(int16_t));
-    return power;
+    (void)dev;
+    event_queue_t *queue = openthread_get_evq();
+
+    switch (status) {
+    case IEEE802154_RADIO_INDICATION_RX_DONE:
+        event_post(queue, &_ev_rx_done);
+        break;
+    case IEEE802154_RADIO_INDICATION_CRC_ERROR:
+        event_post(queue, &_ev_crc_error);
+        break;
+    case IEEE802154_RADIO_INDICATION_TX_START:
+        event_post(queue, &_ev_tx_start);
+        break;
+    case IEEE802154_RADIO_CONFIRM_TX_DONE:
+        event_post(queue, &_ev_tx_done);
+        break;
+    default:
+        break;
+    }
 }
 
-/* set IEEE802.15.4 PAN ID */
-static int _set_panid(uint16_t panid)
+static void _set_rx(void)
 {
-    return _dev->driver->set(_dev, NETOPT_NID, &panid, sizeof(uint16_t));
+    if (ieee802154_radio_set_rx(_dev) < 0) {
+        DEBUG("openthread: cannot set the radio in RX\n");
+    }
 }
 
-/* set extended HW address */
-static int _set_long_addr(uint8_t *ext_addr)
+/* the transceiver must be IDLE to change the PHY configuration */
+static int _config_phy(uint8_t channel, int8_t power)
 {
-    return _dev->driver->set(_dev, NETOPT_ADDRESS_LONG, ext_addr, IEEE802154_LONG_ADDRESS_LEN);
+    ieee802154_phy_conf_t conf = {
+        .phy_mode = IEEE802154_PHY_OQPSK,
+        .channel = channel,
+        .pow = power,
+    };
+    int res;
+
+    ieee802154_radio_set_idle(_dev, true);
+    res = ieee802154_radio_config_phy(_dev, &conf);
+    if (res == 0) {
+        _channel = channel;
+        _tx_power = power;
+    }
+    if ((_state == OT_RADIO_STATE_RECEIVE) || (_state == OT_RADIO_STATE_TRANSMIT)) {
+        _set_rx();
+    }
+    return res;
 }
 
-/* set short address */
-static int _set_addr(uint16_t addr)
+static void _set_filter_mode(void)
 {
-    return _dev->driver->set(_dev, NETOPT_ADDRESS, &addr, sizeof(uint16_t));
+    ieee802154_radio_set_frame_filter_mode(_dev, _promiscuous ? IEEE802154_FILTER_PROMISC
+                                                              : IEEE802154_FILTER_ACCEPT);
 }
 
-/* check the state of promiscuous mode */
-static netopt_enable_t _is_promiscuous(void)
+static void _stop_wait_ack(void)
 {
-    netopt_enable_t en;
-
-    _dev->driver->get(_dev, NETOPT_PROMISCUOUSMODE, &en, sizeof(en));
-    return en == NETOPT_ENABLE ? true : false;;
+    if (_wait_ack) {
+        _wait_ack = false;
+        _set_filter_mode();
+    }
 }
 
-/* set the state of promiscuous mode */
-static int _set_promiscuous(netopt_enable_t enable)
+/* ACK of the transmitted frame, for the radios that wait for the ACK
+ * themselves: OpenThread only uses its frame pending bit */
+static otRadioFrame *_make_ack(bool frame_pending)
 {
-    return _dev->driver->set(_dev, NETOPT_PROMISCUOUSMODE, &enable, sizeof(enable));
+    _ack_psdu[0] = IEEE802154_FCF_TYPE_ACK | (frame_pending ? IEEE802154_FCF_FRAME_PEND : 0);
+    _ack_psdu[1] = 0;
+    _ack_psdu[2] = _tx_psdu[2];
+    _ack_frame.mLength = ACK_PSDU_LEN;
+    _ack_frame.mChannel = _channel;
+    _ack_frame.mInfo.mRxInfo.mRssi = OT_RADIO_RSSI_INVALID;
+    _ack_frame.mInfo.mRxInfo.mLqi = 0;
+    return &_ack_frame;
 }
 
-/* wrapper for setting device state */
-static void _set_state(netopt_state_t state)
+static bool _ack_requested(const otRadioFrame *frame)
 {
-    _dev->driver->set(_dev, NETOPT_STATE, &state, sizeof(netopt_state_t));
+    return frame->mPsdu[0] & IEEE802154_FCF_ACK_REQ;
 }
 
-/* wrapper for getting device state */
-static netopt_state_t _get_state(void)
+static void _tx_done(otRadioFrame *ack, otError error)
 {
-    netopt_state_t state;
-    _dev->driver->get(_dev, NETOPT_STATE, &state, sizeof(netopt_state_t));
-    return state;
+    _state = OT_RADIO_STATE_RECEIVE;
+    otPlatRadioTxDone(openthread_get_instance(), &_tx_frame, ack, error);
 }
 
-static void _set_off(void)
+static void _tx_start_handler(event_t *event)
 {
-    _set_state(NETOPT_STATE_OFF);
+    (void)event;
+    if (_state == OT_RADIO_STATE_TRANSMIT) {
+        otPlatRadioTxStarted(openthread_get_instance(), &_tx_frame);
+    }
 }
 
-/* sets device state to SLEEP */
-static void _set_sleep(void)
+static void _tx_done_handler(event_t *event)
 {
-    _set_state(NETOPT_STATE_SLEEP);
-}
+    (void)event;
+    ieee802154_tx_info_t info = { 0 };
 
-/* set device state to IDLE */
-static void _set_idle(void)
-{
-    _set_state(NETOPT_STATE_IDLE);
-}
-
-/* init framebuffers and initial state */
-void openthread_radio_init(netdev_t *dev, uint8_t *tb, uint8_t *rb)
-{
-    sTransmitFrame.mPsdu = tb;
-    sTransmitFrame.mLength = 0;
-    sReceiveFrame.mPsdu = rb;
-    sReceiveFrame.mLength = 0;
-    _dev = dev;
-}
-
-/* Called upon NETDEV_EVENT_RX_COMPLETE event */
-void recv_pkt(otInstance *aInstance, netdev_t *dev)
-{
-    DEBUG("Openthread: Received pkt\n");
-    netdev_ieee802154_rx_info_t rx_info;
-    /* Read frame length from driver */
-    int len = dev->driver->recv(dev, NULL, 0, NULL);
-
-    /* very unlikely */
-    if ((len < 0) || ((uint32_t)len > UINT16_MAX)) {
-        DEBUG("Invalid len: %d\n", len);
-        otPlatRadioReceiveDone(aInstance, NULL, OT_ERROR_ABORT);
+    if (_state != OT_RADIO_STATE_TRANSMIT) {
+        return;
+    }
+    if (ieee802154_radio_confirm_transmit(_dev, &info) < 0) {
+        /* not finished yet: the radio sends TX done again, or poll */
+        if (!_has_cap(IEEE802154_CAP_IRQ_TX_DONE)) {
+            event_post(openthread_get_evq(), &_ev_tx_done);
+        }
         return;
     }
 
-    /* Fill OpenThread receive frame */
-    /* Openthread needs a packet length with FCS included,
-     * OpenThread do not use the data so we don't need to calculate FCS */
-    sReceiveFrame.mLength = len + RADIO_IEEE802154_FCS_LEN;
-
-    /* Read received frame */
-    int res = dev->driver->recv(dev, (char *) sReceiveFrame.mPsdu, len, &rx_info);
-
-    /* Get RSSI from a radio driver. RSSI should be in [dBm] */
-    Rssi = (int8_t)rx_info.rssi;
-    if (IS_ACTIVE(ENABLE_DEBUG)) {
-        DEBUG("Received message: len %d\n", (int) sReceiveFrame.mLength);
-        for (int i = 0; i < sReceiveFrame.mLength; ++i) {
-            DEBUG("%x ", sReceiveFrame.mPsdu[i]);
+    if (_radio_handles_ack()) {
+        _set_rx();
+        switch (info.status) {
+        case TX_STATUS_SUCCESS:
+            _tx_done(_ack_requested(&_tx_frame) ? _make_ack(false) : NULL, OT_ERROR_NONE);
+            break;
+        case TX_STATUS_FRAME_PENDING:
+            _tx_done(_make_ack(true), OT_ERROR_NONE);
+            break;
+        case TX_STATUS_NO_ACK:
+            _tx_done(NULL, OT_ERROR_NO_ACK);
+            break;
+        case TX_STATUS_MEDIUM_BUSY:
+        default:
+            _tx_done(NULL, OT_ERROR_CHANNEL_ACCESS_FAILURE);
+            break;
         }
-        DEBUG("\n");
+        return;
     }
 
-    /* Tell OpenThread that receive has finished */
-    otPlatRadioReceiveDone(aInstance, res > 0 ? &sReceiveFrame : NULL, res > 0 ? OT_ERROR_NONE : OT_ERROR_ABORT);
+    if (info.status == TX_STATUS_MEDIUM_BUSY) {
+        _set_rx();
+        _tx_done(NULL, OT_ERROR_CHANNEL_ACCESS_FAILURE);
+    }
+    else if (_ack_requested(&_tx_frame)) {
+        /* the ACK timeout is handled by the SubMac of OpenThread, which
+         * calls otPlatRadioReceive() when it expires */
+        _wait_ack = true;
+        ieee802154_radio_set_frame_filter_mode(_dev, IEEE802154_FILTER_ACK_ONLY);
+        _set_rx();
+    }
+    else {
+        _set_rx();
+        _tx_done(NULL, OT_ERROR_NONE);
+    }
 }
 
-/* Called upon TX event */
-#ifdef MODULE_NETDEV_NEW_API
-void send_pkt(otInstance *aInstance, netdev_t *dev, netdev_event_t event)
+static void _tx_failed_handler(event_t *event)
 {
     (void)event;
-
-    assert(dev->driver->confirm_send);
-
-    int res = dev->driver->confirm_send(dev, NULL);
-    DEBUG("openthread: confirm_send returned %d\n", res);
-
-    if (res > 0) {
-        otPlatRadioTxDone(aInstance, &sTransmitFrame, NULL, OT_ERROR_NONE);
-    } else if (res == -EBUSY) {
-        otPlatRadioTxDone(aInstance, &sTransmitFrame, NULL, OT_ERROR_CHANNEL_ACCESS_FAILURE);
-    } else if (res == -EHOSTUNREACH) {
-        otPlatRadioTxDone(aInstance, &sTransmitFrame, NULL, OT_ERROR_NO_ACK);
-    } else {
-        otPlatRadioTxDone(aInstance, &sTransmitFrame, NULL, OT_ERROR_ABORT);
+    if (_state == OT_RADIO_STATE_TRANSMIT) {
+        _tx_done(NULL, _tx_error);
     }
 }
-#else
-void send_pkt(otInstance *aInstance, netdev_t *dev, netdev_event_t event)
+
+/* ACK of the received frame of @p len bytes (without FCS), for the radios
+ * that don't send it themselves. Only the Imm-Ack of the 2003/2006 frames,
+ * with the frame pending bit cleared (no source address match table). */
+static void _send_ack(int len)
 {
-    (void)dev;
+    static uint8_t ack[IEEE802154_ACK_FRAME_LEN - IEEE802154_FCS_LEN];
+    iolist_t psdu = { .iol_base = ack, .iol_len = sizeof(ack) };
+    ieee802154_filter_mode_t mode = IEEE802154_FILTER_ACCEPT;
 
-    /* Tell OpenThread transmission is done depending on the NETDEV event */
-    switch (event) {
-        case NETDEV_EVENT_TX_COMPLETE:
-            DEBUG("openthread: NETDEV_EVENT_TX_COMPLETE\n");
-            otPlatRadioTxDone(aInstance, &sTransmitFrame, NULL, OT_ERROR_NONE);
-            break;
-        case NETDEV_EVENT_TX_COMPLETE_DATA_PENDING:
-            DEBUG("openthread: NETDEV_EVENT_TX_COMPLETE_DATA_PENDING\n");
-            otPlatRadioTxDone(aInstance, &sTransmitFrame, NULL, OT_ERROR_NONE);
-            break;
-        case NETDEV_EVENT_TX_NOACK:
-            DEBUG("openthread: NETDEV_EVENT_TX_NOACK\n");
-            otPlatRadioTxDone(aInstance, &sTransmitFrame, NULL, OT_ERROR_NO_ACK);
-            break;
-        case NETDEV_EVENT_TX_MEDIUM_BUSY:
-            DEBUG("openthread: NETDEV_EVENT_TX_MEDIUM_BUSY\n");
-            otPlatRadioTxDone(aInstance, &sTransmitFrame, NULL, OT_ERROR_CHANNEL_ACCESS_FAILURE);
-            break;
-        default:
-            break;
+    if ((len < 3) || !(_rx_psdu[0] & IEEE802154_FCF_ACK_REQ)
+        || ((_rx_psdu[0] & IEEE802154_FCF_TYPE_MASK) == IEEE802154_FCF_TYPE_ACK)
+        || ((_rx_psdu[1] & IEEE802154_FCF_VERS_MASK) > IEEE802154_FCF_VERS_V1)) {
+        return;
+    }
+    /* frames received in promiscuous mode aren't acknowledged */
+    if ((ieee802154_radio_get_frame_filter_mode(_dev, &mode) == 0)
+        && (mode != IEEE802154_FILTER_ACCEPT)) {
+        return;
+    }
+
+    ack[0] = IEEE802154_FCF_TYPE_ACK;
+    ack[1] = 0;
+    ack[2] = _rx_psdu[2];
+    if (_has_cap(IEEE802154_CAP_AUTO_CSMA)) {
+        /* no CSMA-CA for an ACK */
+        ieee802154_radio_set_csma_params(_dev, NULL, -1);
+    }
+    if ((ieee802154_radio_write(_dev, &psdu) < 0)
+        || (ieee802154_radio_request_transmit(_dev) < 0)) {
+        return;
+    }
+    /* about 350 us on air: wait for the end of the transmission, the TX
+     * done event that follows is ignored (the radio isn't in TRANSMIT) */
+    while (ieee802154_radio_confirm_transmit(_dev, NULL) == -EAGAIN) {}
+}
+
+static void _rx_done_handler(event_t *event)
+{
+    (void)event;
+    ieee802154_rx_info_t info = { 0 };
+    int res;
+
+    ieee802154_radio_set_idle(_dev, false);
+    /* read exactly the length of the frame, as the SubMac of RIOT: some
+     * radios (socket_zep) only accept the exact length */
+    res = ieee802154_radio_len(_dev);
+    if ((res > 0) && (res <= (int)sizeof(_rx_psdu))) {
+        res = ieee802154_radio_read(_dev, _rx_psdu, res, &info);
+    }
+    else {
+        res = -ENOBUFS;
+    }
+    if (res < 0) {
+        /* doesn't fit: discard it */
+        ieee802154_radio_read(_dev, NULL, 0, NULL);
+        _set_rx();
+        return;
+    }
+
+    _rx_frame.mLength = res + IEEE802154_FCS_LEN;
+    _rx_frame.mChannel = _channel;
+    _rx_frame.mInfo.mRxInfo.mRssi = ieee802154_rssi_to_dbm(info.rssi);
+    _rx_frame.mInfo.mRxInfo.mLqi = info.lqi;
+    _rx_frame.mInfo.mRxInfo.mTimestamp = _has_cap(IEEE802154_CAP_RX_TIMESTAMP)
+                                         ? info.timestamp / NS_PER_US : 0;
+    _rx_frame.mInfo.mRxInfo.mAckedWithFramePending = false;
+    _rx_frame.mInfo.mRxInfo.mAckedWithSecEnhAck = false;
+
+    if (_wait_ack) {
+        bool ack = (res >= 3)
+                   && ((_rx_psdu[0] & IEEE802154_FCF_TYPE_MASK) == IEEE802154_FCF_TYPE_ACK)
+                   && (_rx_psdu[2] == _tx_psdu[2]);
+        _set_rx();
+        if (ack && (_state == OT_RADIO_STATE_TRANSMIT)) {
+            _stop_wait_ack();
+            _tx_done(&_rx_frame, OT_ERROR_NONE);
+        }
+        return;
+    }
+
+    if (IS_USED(MODULE_OPENTHREAD_SOFT_ACK) && (_state == OT_RADIO_STATE_RECEIVE)) {
+        _send_ack(res);
+    }
+
+    _set_rx();
+    if ((_state == OT_RADIO_STATE_RECEIVE) || (_state == OT_RADIO_STATE_TRANSMIT)) {
+        otPlatRadioReceiveDone(openthread_get_instance(), &_rx_frame, OT_ERROR_NONE);
     }
 }
-#endif
 
-/* OpenThread will call this for setting PAN ID */
-void otPlatRadioSetPanId(otInstance *aInstance, uint16_t panid)
+static void _crc_error_handler(event_t *event)
+{
+    (void)event;
+    ieee802154_radio_set_idle(_dev, false);
+    ieee802154_radio_read(_dev, NULL, 0, NULL);
+    _set_rx();
+}
+
+int openthread_radio_init(ieee802154_dev_t *dev)
+{
+    int res;
+
+    _dev = dev;
+    _dev->cb = _hal_cb;
+    _tx_frame.mPsdu = _tx_psdu;
+    _rx_frame.mPsdu = _rx_psdu;
+    _ack_frame.mPsdu = _ack_psdu;
+
+    res = ieee802154_radio_request_on(_dev);
+    if (res < 0) {
+        return res;
+    }
+    while ((res = ieee802154_radio_confirm_on(_dev)) == -EAGAIN) {}
+    if (res < 0) {
+        return res;
+    }
+
+    _set_filter_mode();
+    ieee802154_radio_set_cca_threshold(_dev, _cca_threshold);
+    return _config_phy(DEFAULT_CHANNEL, DEFAULT_TX_POWER);
+}
+
+void otPlatRadioGetIeeeEui64(otInstance *aInstance, uint8_t *aIeeeEui64)
 {
     (void)aInstance;
-    DEBUG("openthread: otPlatRadioSetPanId: setting PAN ID to %04x\n", panid);
-    _set_panid(panid);
+    luid_get_eui64((eui64_t *)aIeeeEui64);
 }
 
-/* OpenThread will call this for setting extended address */
+void otPlatRadioSetPanId(otInstance *aInstance, uint16_t aPanId)
+{
+    (void)aInstance;
+    ieee802154_radio_config_addr_filter(_dev, IEEE802154_AF_PANID, &aPanId);
+}
+
 void otPlatRadioSetExtendedAddress(otInstance *aInstance, const otExtAddress *aExtAddress)
 {
     (void)aInstance;
-    DEBUG("openthread: otPlatRadioSetExtendedAddress\n");
-    char reversed_addr[IEEE802154_LONG_ADDRESS_LEN];
-    for (unsigned i = 0; i < IEEE802154_LONG_ADDRESS_LEN; i++) {
-        reversed_addr[i] = (uint8_t) ((uint8_t *)aExtAddress)[IEEE802154_LONG_ADDRESS_LEN - 1 - i];
+    eui64_t addr;
+
+    /* OpenThread gives the address in little endian */
+    for (unsigned i = 0; i < sizeof(addr); i++) {
+        addr.uint8[i] = aExtAddress->m8[sizeof(addr) - 1 - i];
     }
-    if (IS_ACTIVE(ENABLE_DEBUG)) {
-        for (unsigned i = 0; i < IEEE802154_LONG_ADDRESS_LEN; ++i) {
-            DEBUG("%x ", (uint8_t) ((uint8_t *)reversed_addr)[i]);
-        }
-        DEBUG("\n");
-    }
-    _set_long_addr((uint8_t*) reversed_addr);
+    ieee802154_radio_config_addr_filter(_dev, IEEE802154_AF_EXT_ADDR, &addr);
 }
 
-/* OpenThread will call this for setting short address */
 void otPlatRadioSetShortAddress(otInstance *aInstance, uint16_t aShortAddress)
 {
     (void)aInstance;
-    DEBUG("openthread: otPlatRadioSetShortAddress: setting address to %04x\n", aShortAddress);
-    _set_addr(((aShortAddress & 0xff) << 8) | ((aShortAddress >> 8) & 0xff));
-}
+    network_uint16_t addr = byteorder_htons(aShortAddress);
 
-/* OpenThread will call this for enabling the radio */
-otError otPlatRadioEnable(otInstance *aInstance)
-{
-    DEBUG("openthread: otPlatRadioEnable\n");
-    (void)aInstance;
-
-    if (!otPlatRadioIsEnabled(aInstance)) {
-        _set_sleep();
-    }
-
-    return OT_ERROR_NONE;
-}
-
-/* OpenThread will call this for disabling the radio */
-otError otPlatRadioDisable(otInstance *aInstance)
-{
-    DEBUG("openthread: otPlatRadioDisable\n");
-    (void)aInstance;
-
-    if (otPlatRadioIsEnabled(aInstance)) {
-        _set_off();
-    }
-
-    return OT_ERROR_NONE;
+    ieee802154_radio_config_addr_filter(_dev, IEEE802154_AF_SHORT_ADDR, &addr);
 }
 
 bool otPlatRadioIsEnabled(otInstance *aInstance)
 {
-    DEBUG("otPlatRadioIsEnabled\n");
     (void)aInstance;
-    netopt_state_t state = _get_state();
-    if (state == NETOPT_STATE_OFF) {
-        return false;
-    } else {
-        return true;
-    }
+    return _state != OT_RADIO_STATE_DISABLED;
 }
 
-/* OpenThread will call this for setting device state to SLEEP */
+otError otPlatRadioEnable(otInstance *aInstance)
+{
+    (void)aInstance;
+    if (_state == OT_RADIO_STATE_DISABLED) {
+        _state = OT_RADIO_STATE_SLEEP;
+    }
+    return OT_ERROR_NONE;
+}
+
+otError otPlatRadioDisable(otInstance *aInstance)
+{
+    (void)aInstance;
+    _stop_wait_ack();
+    ieee802154_radio_set_idle(_dev, true);
+    _state = OT_RADIO_STATE_DISABLED;
+    return OT_ERROR_NONE;
+}
+
 otError otPlatRadioSleep(otInstance *aInstance)
 {
-    DEBUG("otPlatRadioSleep\n");
     (void)aInstance;
-
-    _set_sleep();
+    if (_state == OT_RADIO_STATE_DISABLED) {
+        return OT_ERROR_INVALID_STATE;
+    }
+    _stop_wait_ack();
+    ieee802154_radio_set_idle(_dev, true);
+    _state = OT_RADIO_STATE_SLEEP;
     return OT_ERROR_NONE;
 }
 
-/*OpenThread will call this for waiting the reception of a packet */
 otError otPlatRadioReceive(otInstance *aInstance, uint8_t aChannel)
 {
-    DEBUG("openthread: otPlatRadioReceive. Channel: %i\n", aChannel);
     (void)aInstance;
-
-    _set_idle();
-    _set_channel(aChannel);
-    sReceiveFrame.mChannel = aChannel;
+    if (_state == OT_RADIO_STATE_DISABLED) {
+        return OT_ERROR_INVALID_STATE;
+    }
+    _stop_wait_ack();
+    _state = OT_RADIO_STATE_RECEIVE;
+    if (aChannel != _channel) {
+        _config_phy(aChannel, _tx_power);
+    }
+    else {
+        _set_rx();
+    }
     return OT_ERROR_NONE;
 }
 
-/* OpenThread will call this function to get the transmit buffer */
 otRadioFrame *otPlatRadioGetTransmitBuffer(otInstance *aInstance)
 {
     (void)aInstance;
-    DEBUG("openthread: otPlatRadioGetTransmitBuffer\n");
-    return &sTransmitFrame;
+    return &_tx_frame;
 }
 
-/* OpenThread will call this function to set the transmit power */
-void otPlatRadioSetDefaultTxPower(otInstance *aInstance, int8_t aPower)
+otError otPlatRadioTransmit(otInstance *aInstance, otRadioFrame *aFrame)
+{
+    uint8_t max_retries = aFrame->mInfo.mTxInfo.mMaxFrameRetries;
+    uint8_t max_backoffs = aFrame->mInfo.mTxInfo.mMaxCsmaBackoffs;
+    bool csma = aFrame->mInfo.mTxInfo.mCsmaCaEnabled;
+    iolist_t psdu = {
+        .iol_base = aFrame->mPsdu,
+        .iol_len = aFrame->mLength - IEEE802154_FCS_LEN,
+    };
+
+    if (_state != OT_RADIO_STATE_RECEIVE) {
+        return OT_ERROR_INVALID_STATE;
+    }
+
+    if (aFrame->mChannel != _channel) {
+        _config_phy(aFrame->mChannel, _tx_power);
+    }
+
+    bool radio_csma = _has_cap(IEEE802154_CAP_AUTO_CSMA)
+                      || _has_cap(IEEE802154_CAP_FRAME_RETRANS);
+
+    /* the backoff was done by OpenThread: assess the channel before the
+     * frame is written, the CCA may leave the radio in RX (nrf802154) */
+    if (!radio_csma && csma && (ieee802154_radio_cca(_dev) == 0)) {
+        /* busy: the transmission ends after this function returns */
+        _state = OT_RADIO_STATE_TRANSMIT;
+        _set_rx();
+        _tx_error = OT_ERROR_CHANNEL_ACCESS_FAILURE;
+        event_post(openthread_get_evq(), &_ev_tx_failed);
+        return OT_ERROR_NONE;
+    }
+
+    ieee802154_radio_set_idle(_dev, true);
+
+    if (_has_cap(IEEE802154_CAP_FRAME_RETRANS)) {
+        ieee802154_radio_set_frame_retrans(_dev, max_retries);
+    }
+    if (radio_csma) {
+        ieee802154_radio_set_csma_params(_dev, NULL, csma ? max_backoffs : -1);
+    }
+
+    if ((ieee802154_radio_write(_dev, &psdu) < 0)
+        || (ieee802154_radio_request_transmit(_dev) < 0)) {
+        _set_rx();
+        return OT_ERROR_INVALID_STATE;
+    }
+    _state = OT_RADIO_STATE_TRANSMIT;
+
+    if (!_has_cap(IEEE802154_CAP_IRQ_TX_START)) {
+        otPlatRadioTxStarted(aInstance, aFrame);
+    }
+    if (!_has_cap(IEEE802154_CAP_IRQ_TX_DONE)) {
+        /* no TX done event: poll the end of the transmission */
+        event_post(openthread_get_evq(), &_ev_tx_done);
+    }
+    return OT_ERROR_NONE;
+}
+
+int8_t otPlatRadioGetRssi(otInstance *aInstance)
 {
     (void)aInstance;
+    /* the Radio HAL doesn't provide an RSSI measure */
+    return OT_RADIO_RSSI_INVALID;
+}
 
-    _set_power(aPower);
+otRadioCaps otPlatRadioGetCaps(otInstance *aInstance)
+{
+    (void)aInstance;
+    otRadioCaps caps = OT_RADIO_CAPS_NONE;
+
+    if (_has_cap(IEEE802154_CAP_FRAME_RETRANS)) {
+        caps |= OT_RADIO_CAPS_ACK_TIMEOUT | OT_RADIO_CAPS_TRANSMIT_RETRIES
+                | OT_RADIO_CAPS_CSMA_BACKOFF;
+    }
+    else {
+        if (_has_cap(IEEE802154_CAP_AUTO_CSMA)) {
+            caps |= OT_RADIO_CAPS_CSMA_BACKOFF;
+        }
+        if (_has_cap(IEEE802154_CAP_IRQ_ACK_TIMEOUT)) {
+            caps |= OT_RADIO_CAPS_ACK_TIMEOUT;
+        }
+    }
+    return caps;
+}
+
+bool otPlatRadioGetPromiscuous(otInstance *aInstance)
+{
+    (void)aInstance;
+    return _promiscuous;
+}
+
+void otPlatRadioSetPromiscuous(otInstance *aInstance, bool aEnable)
+{
+    (void)aInstance;
+    _promiscuous = aEnable;
+    if (!_wait_ack) {
+        _set_filter_mode();
+    }
+}
+
+otError otPlatRadioEnergyScan(otInstance *aInstance, uint8_t aScanChannel, uint16_t aScanDuration)
+{
+    (void)aInstance;
+    (void)aScanChannel;
+    (void)aScanDuration;
+    return OT_ERROR_NOT_IMPLEMENTED;
 }
 
 otError otPlatRadioGetTransmitPower(otInstance *aInstance, int8_t *aPower)
 {
     (void)aInstance;
-    if (aPower == NULL) {
-        return OT_ERROR_INVALID_ARGS;
-    }
-
-    *aPower = _get_power();
-
+    *aPower = _tx_power;
     return OT_ERROR_NONE;
 }
 
 otError otPlatRadioSetTransmitPower(otInstance *aInstance, int8_t aPower)
 {
     (void)aInstance;
-    _set_power(aPower);
+    return (_config_phy(_channel, aPower) == 0) ? OT_ERROR_NONE : OT_ERROR_INVALID_ARGS;
+}
 
+otError otPlatRadioGetCcaEnergyDetectThreshold(otInstance *aInstance, int8_t *aThreshold)
+{
+    (void)aInstance;
+    *aThreshold = _cca_threshold;
     return OT_ERROR_NONE;
 }
 
-/* OpenThread will call this for transmitting a packet*/
-otError otPlatRadioTransmit(otInstance *aInstance, otRadioFrame *aPacket)
+otError otPlatRadioSetCcaEnergyDetectThreshold(otInstance *aInstance, int8_t aThreshold)
 {
-    (void) aInstance;
-
-    /* Populate iolist with transmit data
-     * Unlike RIOT, OpenThread includes two bytes FCS (0x00 0x00) so
-     * these bytes are removed
-     */
-    iolist_t iolist = {
-        .iol_base = aPacket->mPsdu,
-        .iol_len = (aPacket->mLength - RADIO_IEEE802154_FCS_LEN)
-    };
-
-    /*Set channel and power based on transmit frame */
-    if (IS_ACTIVE(ENABLE_DEBUG)) {
-        DEBUG("otPlatRadioTransmit->channel: %i, length %d\n",
-              (int) aPacket->mChannel, (int)aPacket->mLength);
-        for (size_t i = 0; i < aPacket->mLength; ++i) {
-            DEBUG("%x ", aPacket->mPsdu[i]);
-        }
-        DEBUG("\n");
+    (void)aInstance;
+    if (ieee802154_radio_set_cca_threshold(_dev, aThreshold) < 0) {
+        return OT_ERROR_INVALID_ARGS;
     }
-    _set_channel(aPacket->mChannel);
-
-    /* send packet though netdev */
-    _dev->driver->send(_dev, &iolist);
-    otPlatRadioTxStarted(aInstance, aPacket);
-
+    _cca_threshold = aThreshold;
     return OT_ERROR_NONE;
 }
 
-/* OpenThread will call this for getting the radio caps */
-otRadioCaps otPlatRadioGetCaps(otInstance *aInstance)
+int8_t otPlatRadioGetReceiveSensitivity(otInstance *aInstance)
 {
     (void)aInstance;
-    DEBUG("openthread: otPlatRadioGetCaps\n");
-    /* all drivers should handle ACK, including call of NETDEV_EVENT_TX_NOACK */
-    return OT_RADIO_CAPS_TRANSMIT_RETRIES | OT_RADIO_CAPS_ACK_TIMEOUT;
+    return OPENTHREAD_RX_SENSITIVITY;
 }
 
-/* OpenThread will call this for getting the state of promiscuous mode */
-bool otPlatRadioGetPromiscuous(otInstance *aInstance)
-{
-    (void)aInstance;
-    DEBUG("openthread: otPlatRadioGetPromiscuous\n");
-    return _is_promiscuous();
-}
-
-/* OpenThread will call this for setting the state of promiscuous mode */
-void otPlatRadioSetPromiscuous(otInstance *aInstance, bool aEnable)
-{
-    (void)aInstance;
-    DEBUG("openthread: otPlatRadioSetPromiscuous\n");
-    _set_promiscuous((aEnable) ? NETOPT_ENABLE : NETOPT_DISABLE);
-}
-
-int8_t otPlatRadioGetRssi(otInstance *aInstance)
-{
-    DEBUG("otPlatRadioGetRssi\n");
-    (void)aInstance;
-    return Rssi;
-}
-
+/* Source address match (frame pending bit of the ACKs to Data Requests): only
+ * the enable switch of the Radio HAL is used, the radios of RIOT don't have
+ * address tables */
 void otPlatRadioEnableSrcMatch(otInstance *aInstance, bool aEnable)
 {
-    DEBUG("otPlatRadioEnableSrcMatch\n");
     (void)aInstance;
-    (void)aEnable;
+    ieee802154_radio_config_src_address_match(_dev, IEEE802154_SRC_MATCH_EN, &aEnable);
 }
 
-otError otPlatRadioAddSrcMatchShortEntry(otInstance *aInstance, const uint16_t aShortAddress)
+otError otPlatRadioAddSrcMatchShortEntry(otInstance *aInstance, otShortAddress aShortAddress)
 {
-    DEBUG("otPlatRadioAddSrcMatchShortEntry\n");
     (void)aInstance;
     (void)aShortAddress;
     return OT_ERROR_NONE;
@@ -429,15 +623,13 @@ otError otPlatRadioAddSrcMatchShortEntry(otInstance *aInstance, const uint16_t a
 
 otError otPlatRadioAddSrcMatchExtEntry(otInstance *aInstance, const otExtAddress *aExtAddress)
 {
-    DEBUG("otPlatRadioAddSrcMatchExtEntry\n");
     (void)aInstance;
     (void)aExtAddress;
     return OT_ERROR_NONE;
 }
 
-otError otPlatRadioClearSrcMatchShortEntry(otInstance *aInstance, const uint16_t aShortAddress)
+otError otPlatRadioClearSrcMatchShortEntry(otInstance *aInstance, otShortAddress aShortAddress)
 {
-    DEBUG("otPlatRadioClearSrcMatchShortEntry\n");
     (void)aInstance;
     (void)aShortAddress;
     return OT_ERROR_NONE;
@@ -445,7 +637,6 @@ otError otPlatRadioClearSrcMatchShortEntry(otInstance *aInstance, const uint16_t
 
 otError otPlatRadioClearSrcMatchExtEntry(otInstance *aInstance, const otExtAddress *aExtAddress)
 {
-    DEBUG("otPlatRadioClearSrcMatchExtEntry\n");
     (void)aInstance;
     (void)aExtAddress;
     return OT_ERROR_NONE;
@@ -453,38 +644,10 @@ otError otPlatRadioClearSrcMatchExtEntry(otInstance *aInstance, const otExtAddre
 
 void otPlatRadioClearSrcMatchShortEntries(otInstance *aInstance)
 {
-    DEBUG("otPlatRadioClearSrcMatchShortEntries\n");
     (void)aInstance;
 }
 
 void otPlatRadioClearSrcMatchExtEntries(otInstance *aInstance)
 {
-    DEBUG("otPlatRadioClearSrcMatchExtEntries\n");
     (void)aInstance;
-}
-
-otError otPlatRadioEnergyScan(otInstance *aInstance, uint8_t aScanChannel, uint16_t aScanDuration)
-{
-    DEBUG("otPlatRadioEnergyScan\n");
-    (void)aInstance;
-    (void)aScanChannel;
-    (void)aScanDuration;
-    return OT_ERROR_NOT_IMPLEMENTED;
-}
-
-void otPlatRadioGetIeeeEui64(otInstance *aInstance, uint8_t *aIeee64Eui64)
-{
-    uint8_t addr[IEEE802154_LONG_ADDRESS_LEN];
-
-    (void)aInstance;
-    _dev->driver->get(_dev, NETOPT_ADDRESS_LONG, addr, sizeof(addr));
-    l2util_ipv6_iid_from_addr(NETDEV_TYPE_IEEE802154,
-                              addr, sizeof(eui64_t),
-                              (eui64_t *)aIeee64Eui64);
-}
-
-int8_t otPlatRadioGetReceiveSensitivity(otInstance *aInstance)
-{
-    (void) aInstance;
-    return -100;
 }
