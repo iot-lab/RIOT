@@ -56,7 +56,22 @@ ipaddr
 ```
 5. Ping from another node with
 ```
-ping fdde:ad00:beef:0:946a:c722:a5d9:848
+ot ping fdde:ad00:beef:0:946a:c722:a5d9:848
+```
+
+## Native
+
+On the native boards, the nodes use a ZEP socket as radio
+(`socket_zep`). Start `dist/tools/zep_dispatch` to connect them, then
+each node in its own terminal:
+
+```
+make -C dist/tools/zep_dispatch
+dist/tools/zep_dispatch/bin/zep_dispatch ::1 17754
+```
+```
+make BOARD=native64 all
+bin/native64/openthread.elf -z [::1]:17754
 ```
 
 6. You can try IEEE802.15.4 scan with `ot scan` command
