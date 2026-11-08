@@ -200,6 +200,9 @@ static void *_openthread_thread(void *arg)
 #  if IS_USED(MODULE_SHELL_CMD_OPENTHREAD)
     ot_shell_init(_instance);
 #  endif
+#  if IS_USED(MODULE_OPENTHREAD_BORDER_ROUTER)
+    openthread_border_router_init(_instance);
+#  endif
 #  if defined(OPENTHREAD_PANID) && defined(OPENTHREAD_CHANNEL)
     _start_network();
 #  endif

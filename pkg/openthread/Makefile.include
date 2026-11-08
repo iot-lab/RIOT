@@ -2,6 +2,8 @@ OPENTHREAD_DIR = $(RIOTBASE)/pkg/openthread
 
 # the OpenThread radio layer sends the ACKs of the received frames
 PSEUDOMODULES += openthread_soft_ack
+# border router of the Thread network over ethos (see contrib/border_router.c)
+PSEUDOMODULES += openthread_border_router
 
 INCLUDES += -I$(PKGDIRBASE)/openthread/include
 INCLUDES += -I$(OPENTHREAD_DIR)/include

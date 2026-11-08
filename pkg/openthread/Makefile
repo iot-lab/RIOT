@@ -43,6 +43,10 @@ OT_MODULES += mbedcrypto mbedtls openthread-platform-utils-static
 
 # Enable CoAP
 OT_COAP ?= ON
+# Enable the border router API with openthread_border_router
+OT_BORDER_ROUTER ?= $(if $(filter openthread_border_router,$(USEMODULE)),ON,OFF)
+# Enable SLAAC: addresses in the on-mesh prefixes of the border routers
+OT_SLAAC ?= ON
 # Enable the ping sender (CLI ping)
 OT_PING_SENDER ?= ON
 
@@ -117,6 +121,8 @@ $(PKG_BUILD_DIR)/Makefile: $(OT_MBEDTLS_DIR)/CMakeLists.txt
 	 -DOT_RCP=$(OT_RCP) \
 	 -DOT_JOINER=$(OT_JOINER) \
 	 -DOT_COAP=$(OT_COAP) \
+	 -DOT_BORDER_ROUTER=$(OT_BORDER_ROUTER) \
 	 -DOT_PING_SENDER=$(OT_PING_SENDER) \
+	 -DOT_SLAAC=$(OT_SLAAC) \
 	 -DOT_TCP=OFF \
 	 -DOT_PLATFORM_DEFINES="OPENTHREAD_SETTINGS_RAM=1"

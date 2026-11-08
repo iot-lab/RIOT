@@ -22,6 +22,16 @@ ifneq (,$(filter openthread-cli-%,$(USEMODULE)))
   USEMODULE += shell_cmds_default
 endif
 
+ifneq (,$(filter openthread_border_router,$(USEMODULE)))
+  ifeq (,$(filter openthread-ftd,$(USEMODULE)))
+    $(error openthread_border_router needs openthread-ftd)
+  endif
+  # IPv6 and stdio over ethos, as gnrc_border_router
+  USEMODULE += ethos
+  USEMODULE += stdio_ethos
+  USEMODULE += inet_csum
+endif
+
 ifneq (,$(filter openthread-rcp,$(USEMODULE)))
   # spinel over HDLC on a UART, see OPENTHREAD_RCP_UART_DEV
   FEATURES_REQUIRED += periph_uart
