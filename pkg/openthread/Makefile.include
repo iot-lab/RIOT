@@ -17,6 +17,11 @@ ifneq (,$(filter cortex-m0% cortex-m3%,$(CPU_CORE)))
 endif
 
 ARCHIVES += $(addprefix $(BINDIR)/,$(addsuffix .a,$(filter openthread-%,$(USEMODULE))))
+ifneq (,$(filter openthread-rcp,$(USEMODULE)))
+  ARCHIVES += $(BINDIR)/openthread-radio.a
+  ARCHIVES += $(BINDIR)/openthread-hdlc.a
+  ARCHIVES += $(BINDIR)/openthread-spinel-rcp.a
+endif
 # settings in RAM (examples/platforms/utils of OpenThread)
 ARCHIVES += $(BINDIR)/openthread-platform-utils-static.a
 ARCHIVES += $(BINDIR)/mbedcrypto.a

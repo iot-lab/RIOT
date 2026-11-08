@@ -10,20 +10,36 @@ ifneq (,$(filter openthread-ftd,$(USEMODULE)))
   TD = ftd
   OT_FTD := ON
   OT_MTD := OFF
+  OT_RCP := OFF
   OT_JOINER := OFF
 else ifneq (,$(filter openthread-mtd,$(USEMODULE)))
   TD = mtd
   OT_FTD := OFF
   OT_MTD := ON
+  OT_RCP := OFF
   OT_JOINER := ON
+else ifneq (,$(filter openthread-rcp,$(USEMODULE)))
+  TD = rcp
+  OT_FTD := OFF
+  OT_MTD := OFF
+  OT_RCP := ON
+  OT_JOINER := OFF
 else
-  $(error "Please use either USEMODULE=openthread-ftd or USEMODULE=openthread-mtd")
+  $(error "Please use either USEMODULE=openthread-ftd, openthread-mtd or openthread-rcp")
 endif
 
-OT_MODULES = mbedcrypto mbedtls openthread-$(TD) openthread-platform-utils-static
-ifneq (,$(filter openthread-cli-$(TD),$(USEMODULE)))
-  OT_MODULES += openthread-cli-$(TD)
+ifeq (rcp,$(TD))
+  # radio only core and spinel over HDLC (Radio Co-Processor of a host)
+  OT_CORE_LIB = openthread-radio
+  OT_MODULES = openthread-radio openthread-rcp openthread-hdlc openthread-spinel-rcp
+else
+  OT_CORE_LIB = openthread-$(TD)
+  OT_MODULES = openthread-$(TD)
+  ifneq (,$(filter openthread-cli-$(TD),$(USEMODULE)))
+    OT_MODULES += openthread-cli-$(TD)
+  endif
 endif
+OT_MODULES += mbedcrypto mbedtls openthread-platform-utils-static
 
 # Enable CoAP
 OT_COAP ?= ON
@@ -40,10 +56,19 @@ OT_CXXFLAGS += -Wno-class-memaccess
 OT_CXXFLAGS += -DOPENTHREAD_TARGET_RIOT
 
 OT_MODULES_ARCHIVES = $(addsuffix .a,$(addprefix $(BINDIR)/,$(OT_MODULES)))
-OT_CORE_LIB_DIR = $(PKG_BUILD_DIR)/src/core
-OT_CLI_LIB_DIR = $(PKG_BUILD_DIR)/src/cli
-OT_UTILS_LIB_DIR = $(PKG_BUILD_DIR)/examples/platforms/utils
-OT_MBEDCRYPTO_LIB_DIR = $(PKG_BUILD_DIR)/third_party/mbedtls/repo/library
+
+# build directory of each library
+OT_LIB_DIR_openthread-ftd = src/core
+OT_LIB_DIR_openthread-mtd = src/core
+OT_LIB_DIR_openthread-radio = src/core
+OT_LIB_DIR_openthread-cli-ftd = src/cli
+OT_LIB_DIR_openthread-cli-mtd = src/cli
+OT_LIB_DIR_openthread-rcp = src/ncp
+OT_LIB_DIR_openthread-hdlc = src/lib/hdlc
+OT_LIB_DIR_openthread-spinel-rcp = src/lib/spinel
+OT_LIB_DIR_openthread-platform-utils-static = examples/platforms/utils
+OT_LIB_DIR_mbedtls = third_party/mbedtls/repo/library
+OT_LIB_DIR_mbedcrypto = third_party/mbedtls/repo/library
 
 ifeq (llvm,$(TOOLCHAIN))
   OT_C_FLAGS += -target $(TARGET_ARCH_LLVM)
@@ -54,22 +79,11 @@ endif
 all: $(OT_MODULES_ARCHIVES)
 	@:
 
-$(BINDIR)/mbedtls.a: $(BINDIR)/openthread-$(TD).a
-	@cp $(OT_MBEDCRYPTO_LIB_DIR)/libmbedtls.a $@
+# all the libraries are built by one make call, with the core library
+$(OT_MODULES_ARCHIVES): $(PKG_BUILD_DIR)/$(OT_LIB_DIR_$(OT_CORE_LIB))/lib$(OT_CORE_LIB).a
+	@cp $(PKG_BUILD_DIR)/$(OT_LIB_DIR_$(basename $(notdir $@)))/lib$(basename $(notdir $@)).a $@
 
-$(BINDIR)/mbedcrypto.a: $(BINDIR)/openthread-$(TD).a
-	@cp $(OT_MBEDCRYPTO_LIB_DIR)/libmbedcrypto.a $@
-
-$(BINDIR)/openthread-cli-$(TD).a: $(BINDIR)/openthread-$(TD).a
-	@cp $(OT_CLI_LIB_DIR)/libopenthread-cli-$(TD).a $@
-
-$(BINDIR)/openthread-platform-utils-static.a: $(BINDIR)/openthread-$(TD).a
-	@cp $(OT_UTILS_LIB_DIR)/libopenthread-platform-utils-static.a $@
-
-$(BINDIR)/openthread-$(TD).a: $(OT_CORE_LIB_DIR)/libopenthread-$(TD).a
-	@cp $< $@
-
-$(OT_CORE_LIB_DIR)/libopenthread-$(TD).a: $(PKG_BUILD_DIR)/Makefile
+$(PKG_BUILD_DIR)/$(OT_LIB_DIR_$(OT_CORE_LIB))/lib$(OT_CORE_LIB).a: $(PKG_BUILD_DIR)/Makefile
 	$(QQ)"$(MAKE)" -C $(PKG_BUILD_DIR) $(OT_MODULES)
 
 # mbedtls is a git submodule of OpenThread, fetched at the revision pinned by
@@ -100,7 +114,7 @@ $(PKG_BUILD_DIR)/Makefile: $(OT_MBEDTLS_DIR)/CMakeLists.txt
 	 -DOT_APP_RCP=OFF \
 	 -DOT_FTD=$(OT_FTD) \
 	 -DOT_MTD=$(OT_MTD) \
-	 -DOT_RCP=OFF \
+	 -DOT_RCP=$(OT_RCP) \
 	 -DOT_JOINER=$(OT_JOINER) \
 	 -DOT_COAP=$(OT_COAP) \
 	 -DOT_PING_SENDER=$(OT_PING_SENDER) \

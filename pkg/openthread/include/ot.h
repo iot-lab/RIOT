@@ -40,6 +40,10 @@
  * The radio is driven through the IEEE 802.15.4 Radio HAL: every radio of
  * RIOT with a Radio HAL implementation can be used.
  *
+ * With `openthread-rcp`, the node is the Radio Co-Processor of an OpenThread
+ * host (e.g. the border router `otbr-agent`): spinel over HDLC on
+ * @ref OPENTHREAD_RCP_UART_DEV. stdio must not use this UART (`stdio_null`).
+ *
  * When `OPENTHREAD_PANID` and `OPENTHREAD_CHANNEL` are defined, OpenThread
  * starts at boot with an active dataset built from them (and the defaults of
  * the other `OPENTHREAD_*` dataset macros): the nodes built with the same
@@ -83,6 +87,28 @@ extern "C" {
  *          (the Radio HAL doesn't provide it)
  */
 #define OPENTHREAD_RX_SENSITIVITY   (-100)
+#endif
+
+#ifndef OPENTHREAD_RCP_UART_DEV
+/**
+ * @brief   UART of the spinel link of the Radio Co-Processor
+ *          (`openthread-rcp`), not usable by stdio
+ */
+#define OPENTHREAD_RCP_UART_DEV     UART_DEV(0)
+#endif
+
+#ifndef OPENTHREAD_RCP_UART_BAUDRATE
+/**
+ * @brief   Baudrate of the spinel link of the Radio Co-Processor
+ */
+#define OPENTHREAD_RCP_UART_BAUDRATE    (115200U)
+#endif
+
+#ifndef OPENTHREAD_RCP_RX_BUFSIZE
+/**
+ * @brief   Size of the buffer of the bytes received on the spinel link
+ */
+#define OPENTHREAD_RCP_RX_BUFSIZE   (512U)
 #endif
 
 #ifndef OPENTHREAD_NETWORK_NAME
@@ -147,6 +173,15 @@ void openthread_bootstrap(void);
  * @retval  negative errno on error
  */
 int openthread_radio_init(ieee802154_dev_t *dev);
+
+/**
+ * @brief   Initialize the spinel link of the Radio Co-Processor
+ *
+ * @internal Called from the OpenThread thread, with `openthread-rcp`.
+ *
+ * @param[in]  instance  OpenThread instance
+ */
+void openthread_rcp_init(otInstance *instance);
 
 /**
  * @brief   Initialize the OpenThread CLI on the RIOT shell (`ot` command)

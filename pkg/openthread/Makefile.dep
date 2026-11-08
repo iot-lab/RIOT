@@ -22,4 +22,10 @@ ifneq (,$(filter openthread-cli-%,$(USEMODULE)))
   USEMODULE += shell_cmds_default
 endif
 
+ifneq (,$(filter openthread-rcp,$(USEMODULE)))
+  # spinel over HDLC on a UART, see OPENTHREAD_RCP_UART_DEV
+  FEATURES_REQUIRED += periph_uart
+  USEMODULE += tsrb
+endif
+
 FEATURES_REQUIRED += cpp

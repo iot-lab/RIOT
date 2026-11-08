@@ -55,6 +55,23 @@ extern "C" {
  */
 #define OPENTHREAD_CONFIG_CLI_LOG_INPUT_OUTPUT_ENABLE 0
 
+#if OPENTHREAD_RADIO
+/**
+ * @name    SubMac of the Radio Co-Processor
+ *
+ * In a radio only build, the SubMac does in software only the
+ * capabilities enabled here, when the radio doesn't have them. The hosts
+ * (ot-cli, otbr-agent) require ACK timeout, retransmissions and transmit
+ * security from the RCP.
+ * @{
+ */
+#define OPENTHREAD_CONFIG_MAC_SOFTWARE_ACK_TIMEOUT_ENABLE   1
+#define OPENTHREAD_CONFIG_MAC_SOFTWARE_RETRANSMIT_ENABLE    1
+#define OPENTHREAD_CONFIG_MAC_SOFTWARE_CSMA_BACKOFF_ENABLE  1
+#define OPENTHREAD_CONFIG_MAC_SOFTWARE_TX_SECURITY_ENABLE   1
+/** @} */
+#endif
+
 #ifdef __cplusplus
 }
 #endif
