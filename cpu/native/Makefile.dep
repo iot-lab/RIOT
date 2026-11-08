@@ -38,6 +38,7 @@ endif
 
 ifneq (,$(filter socket_zep,$(USEMODULE)))
   USEMODULE += iolist
+  USEMODULE += ztimer_usec
   USEMODULE += checksum
   USEMODULE += random
   USEMODULE += ieee802154
