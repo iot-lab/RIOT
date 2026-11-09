@@ -22,12 +22,20 @@ extern "C" {
 /**
  * @def OPENTHREAD_CONFIG_NUM_MESSAGE_BUFFERS
  *
- * The number of message buffers in buffer pool
+ * The number of message buffers in buffer pool (128 bytes each on 32-bit
+ * platforms). A message larger than a frame (a CoAP response of a few
+ * hundred bytes, a fragmented datagram) takes several buffers while it is
+ * sent: the FTD, which also forwards the messages of its children and
+ * neighbors, gets the default of OpenThread.
  */
-#if OPENTHREAD_MTD
+#ifndef OPENTHREAD_CONFIG_NUM_MESSAGE_BUFFERS
+#if OPENTHREAD_FTD
+#define OPENTHREAD_CONFIG_NUM_MESSAGE_BUFFERS       (44U)
+#elif OPENTHREAD_MTD
 #define OPENTHREAD_CONFIG_NUM_MESSAGE_BUFFERS       (20U)
 #else
 #define OPENTHREAD_CONFIG_NUM_MESSAGE_BUFFERS       (10U)
+#endif
 #endif
 
 /**

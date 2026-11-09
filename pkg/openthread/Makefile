@@ -50,6 +50,17 @@ OT_SLAAC ?= ON
 # Enable the ping sender (CLI ping)
 OT_PING_SENDER ?= ON
 
+# Number of message buffers of OpenThread (include/platform_config.h): empty
+# for the default of the device type
+OPENTHREAD_NUM_MESSAGE_BUFFERS ?=
+OT_PLATFORM_DEFINES = OPENTHREAD_SETTINGS_RAM=1
+ifneq (,$(OPENTHREAD_NUM_MESSAGE_BUFFERS))
+  OT_PLATFORM_DEFINES += OPENTHREAD_CONFIG_NUM_MESSAGE_BUFFERS=$(OPENTHREAD_NUM_MESSAGE_BUFFERS)
+endif
+# cmake list
+OT_EMPTY :=
+OT_SPACE := $(OT_EMPTY) $(OT_EMPTY)
+
 OT_C_FLAGS = $(CFLAGS_CPU)
 OT_C_FLAGS += -fdata-sections
 OT_C_FLAGS += -ffunction-sections -Os
@@ -125,4 +136,4 @@ $(PKG_BUILD_DIR)/Makefile: $(OT_MBEDTLS_DIR)/CMakeLists.txt
 	 -DOT_PING_SENDER=$(OT_PING_SENDER) \
 	 -DOT_SLAAC=$(OT_SLAAC) \
 	 -DOT_TCP=OFF \
-	 -DOT_PLATFORM_DEFINES="OPENTHREAD_SETTINGS_RAM=1"
+	 -DOT_PLATFORM_DEFINES="$(subst $(OT_SPACE),;,$(strip $(OT_PLATFORM_DEFINES)))"
