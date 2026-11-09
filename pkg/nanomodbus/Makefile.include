@@ -1,0 +1,8 @@
+INCLUDES += -I$(PKGDIRBASE)/nanomodbus
+INCLUDES += -I$(RIOTBASE)/pkg/nanomodbus/include
+
+DIRS += $(RIOTBASE)/pkg/nanomodbus/contrib
+
+PSEUDOMODULES += nanomodbus_tcp
+PSEUDOMODULES += nanomodbus_uart
+PSEUDOMODULES += nanomodbus_udp

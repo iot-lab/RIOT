@@ -1,0 +1,18 @@
+ifneq (,$(filter nanomodbus_tcp nanomodbus_uart nanomodbus_udp,$(USEMODULE)))
+  USEMODULE += nanomodbus_contrib
+endif
+
+ifneq (,$(filter nanomodbus_uart,$(USEMODULE)))
+  FEATURES_REQUIRED += periph_gpio
+  FEATURES_REQUIRED += periph_uart
+  USEMODULE += isrpipe
+  USEMODULE += isrpipe_read_timeout
+endif
+
+ifneq (,$(filter nanomodbus_tcp,$(USEMODULE)))
+  USEMODULE += sock_tcp
+endif
+
+ifneq (,$(filter nanomodbus_udp,$(USEMODULE)))
+  USEMODULE += sock_udp
+endif
